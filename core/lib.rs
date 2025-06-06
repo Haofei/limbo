@@ -240,6 +240,7 @@ impl Database {
             syms: RefCell::new(SymbolTable::new()),
             total_changes: Cell::new(0),
             _shared_cache: false,
+            cache_size: Cell::new(self.header.lock().default_page_cache_size),
         });
         if let Err(e) = conn.register_builtins() {
             return Err(LimboError::ExtensionError(e));
@@ -339,6 +340,7 @@ pub struct Connection {
     total_changes: Cell<i64>,
     syms: RefCell<SymbolTable>,
     _shared_cache: bool,
+    cache_size: Cell<i32>,
 }
 
 impl Connection {
@@ -593,6 +595,13 @@ impl Connection {
 
     pub fn total_changes(&self) -> i64 {
         self.total_changes.get()
+    }
+
+    pub fn get_cache_size(&self) -> i32 {
+        self.cache_size.get()
+    }
+    pub fn set_cache_size(&self, size: i32) {
+        self.cache_size.set(size);
     }
 
     #[cfg(feature = "fs")]

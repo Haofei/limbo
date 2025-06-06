@@ -251,7 +251,7 @@ impl Default for DatabaseHeader {
             freelist_pages: 0,
             schema_cookie: 0,
             schema_format: 4, // latest format, new sqlite3 databases use this format
-            default_page_cache_size: 500, // pages
+            default_page_cache_size: DEFAULT_CACHE_SIZE,
             vacuum_mode_largest_root_page: 0,
             text_encoding: 1, // utf-8
             user_version: 0,

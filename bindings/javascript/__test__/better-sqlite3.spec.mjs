@@ -95,6 +95,12 @@ test("Test exec()", async (t) => {
   }
 });
 
+test("Test Statement.database gets the database object", async t => {
+  const [db] = await connect(":memory:");
+  let stmt = db.prepare("SELECT 1");
+  t.is(stmt.database, db);
+});
+
 
 const connect = async (path) => {
   const db = new Database(path);
