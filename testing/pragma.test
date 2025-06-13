@@ -3,6 +3,16 @@
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
+do_execsql_test_on_specific_db ":memory:" pragma-cache-size-default {
+  PRAGMA cache_size
+} {-2000}
+
+do_execsql_test pragma-set-cache-size {
+  PRAGMA cache_size = 100;
+  PRAGMA cache_size
+} {100}
+
+# Even though the cache size was set to 100 in previous test, a new connection defaults back to -2000.
 do_execsql_test pragma-cache-size {
   PRAGMA cache_size
 } {-2000}
@@ -30,6 +40,33 @@ do_execsql_test pragma-table-info-equal-syntax {
 
 do_execsql_test pragma-table-info-call-syntax {
   PRAGMA table_info(sqlite_schema)
+} {0|type|TEXT|0||0
+1|name|TEXT|0||0
+2|tbl_name|TEXT|0||0
+3|rootpage|INT|0||0
+4|sql|TEXT|0||0
+}
+
+do_execsql_test pragma-table-info-alt-name-equal-syntax {
+  PRAGMA table_info=sqlite_master
+} {0|type|TEXT|0||0
+1|name|TEXT|0||0
+2|tbl_name|TEXT|0||0
+3|rootpage|INT|0||0
+4|sql|TEXT|0||0
+}
+
+do_execsql_test pragma-table-info-alt-name-call-syntax {
+  PRAGMA table_info(sqlite_master)
+} {0|type|TEXT|0||0
+1|name|TEXT|0||0
+2|tbl_name|TEXT|0||0
+3|rootpage|INT|0||0
+4|sql|TEXT|0||0
+}
+
+do_execsql_test pragma-function-table-info-alt-name {
+  SELECT * FROM pragma_table_info('sqlite_master')
 } {0|type|TEXT|0||0
 1|name|TEXT|0||0
 2|tbl_name|TEXT|0||0
