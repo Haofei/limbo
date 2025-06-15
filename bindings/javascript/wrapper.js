@@ -22,6 +22,11 @@ class Database {
           return db.inTransaction();
         },
       },
+      name: {
+        get() {
+          return path;
+        },
+      },
     });
   }
 
@@ -32,7 +37,7 @@ class Database {
    */
   prepare(sql) {
     try {
-      return new Statement(this.db.prepare(sql));
+      return new Statement(this.db.prepare(sql), this);
     } catch (err) {
       throw convertError(err);
     }
@@ -88,8 +93,8 @@ class Database {
     const pragma = `PRAGMA ${source}`;
 
     return simple
-      ? this.db.pragma(pragma, true)
-      : this.db.pragma(pragma, false);
+      ? this.db.pragma(source, { simple: true })
+      : this.db.pragma(source);
   }
 
   backup(filename, options) {
@@ -148,8 +153,9 @@ class Database {
  * Statement represents a prepared SQL statement that can be executed.
  */
 class Statement {
-  constructor(stmt) {
+  constructor(stmt, database) {
     this.stmt = stmt;
+    this.db = database;
   }
 
   /**
@@ -172,8 +178,20 @@ class Statement {
     return this;
   }
 
+  get source() {
+    return this.stmt.source;
+  }
+
   get reader() {
     throw new Error("not implemented");
+  }
+
+  get source() {
+    return this.stmt.source;
+  }
+
+  get database() {
+    return this.db;
   }
 
   /**

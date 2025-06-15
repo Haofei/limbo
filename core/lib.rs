@@ -240,6 +240,7 @@ impl Database {
             syms: RefCell::new(SymbolTable::new()),
             total_changes: Cell::new(0),
             _shared_cache: false,
+            cache_size: Cell::new(self.header.lock().default_page_cache_size),
         });
         if let Err(e) = conn.register_builtins() {
             return Err(LimboError::ExtensionError(e));
@@ -339,6 +340,7 @@ pub struct Connection {
     total_changes: Cell<i64>,
     syms: RefCell<SymbolTable>,
     _shared_cache: bool,
+    cache_size: Cell<i32>,
 }
 
 impl Connection {
@@ -564,17 +566,7 @@ impl Connection {
 
     /// Close a connection and checkpoint.
     pub fn close(&self) -> Result<()> {
-        loop {
-            // TODO: make this async?
-            match self.pager.checkpoint()? {
-                CheckpointStatus::Done(_) => {
-                    return Ok(());
-                }
-                CheckpointStatus::IO => {
-                    self.pager.io.run_once()?;
-                }
-            };
-        }
+        self.pager.checkpoint_shutdown()
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -593,6 +585,13 @@ impl Connection {
 
     pub fn total_changes(&self) -> i64 {
         self.total_changes.get()
+    }
+
+    pub fn get_cache_size(&self) -> i32 {
+        self.cache_size.get()
+    }
+    pub fn set_cache_size(&self, size: i32) {
+        self.cache_size.set(size);
     }
 
     #[cfg(feature = "fs")]
@@ -780,7 +779,7 @@ impl Statement {
     }
 
     pub fn get_column_name(&self, idx: usize) -> Cow<str> {
-        let column = &self.program.result_columns[idx];
+        let column = &self.program.result_columns.get(idx).expect("No column");
         match column.name(&self.program.table_references) {
             Some(name) => Cow::Borrowed(name),
             None => Cow::Owned(column.expr.to_string()),
