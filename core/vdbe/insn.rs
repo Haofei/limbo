@@ -6,9 +6,10 @@ use std::{
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::{
-    schema::{BTreeTable, Index},
+    schema::{Affinity, BTreeTable, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     translate::collate::CollationSeq,
+    Value,
 };
 use limbo_macros::Description;
 use limbo_sqlite3_parser::ast::SortOrder;
@@ -20,6 +21,7 @@ pub struct CmpInsFlags(usize);
 impl CmpInsFlags {
     const NULL_EQ: usize = 0x80;
     const JUMP_IF_NULL: usize = 0x10;
+    const AFFINITY_MASK: usize = 0x47;
 
     fn has(&self, flag: usize) -> bool {
         (self.0 & flag) != 0
@@ -41,6 +43,17 @@ impl CmpInsFlags {
 
     pub fn has_nulleq(&self) -> bool {
         self.has(CmpInsFlags::NULL_EQ)
+    }
+
+    pub fn with_affinity(mut self, affinity: Affinity) -> Self {
+        let aff_code = affinity.to_char_code() as usize;
+        self.0 = (self.0 & !Self::AFFINITY_MASK) | aff_code;
+        self
+    }
+
+    pub fn get_affinity(&self) -> Affinity {
+        let aff_code = (self.0 & Self::AFFINITY_MASK) as u8;
+        Affinity::from_char_code(aff_code).unwrap_or(Affinity::Blob)
     }
 }
 
@@ -77,6 +90,30 @@ impl IdxInsertFlags {
             self.0 |= IdxInsertFlags::NCHANGE;
         } else {
             self.0 &= !IdxInsertFlags::NCHANGE;
+        }
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InsertFlags(pub u8);
+
+impl InsertFlags {
+    pub const UPDATE: u8 = 0x01; // Flag indicating this is part of an UPDATE statement
+
+    pub fn new() -> Self {
+        InsertFlags(0)
+    }
+
+    pub fn has(&self, flag: u8) -> bool {
+        (self.0 & flag) != 0
+    }
+
+    pub fn update(mut self, is_update: bool) -> Self {
+        if is_update {
+            self.0 |= InsertFlags::UPDATE;
+        } else {
+            self.0 &= !InsertFlags::UPDATE;
         }
         self
     }
@@ -364,6 +401,7 @@ pub enum Insn {
         cursor_id: CursorID,
         column: usize,
         dest: usize,
+        default: Option<Value>,
     },
 
     TypeCheck {
@@ -404,6 +442,13 @@ pub enum Insn {
     Halt {
         err_code: usize,
         description: String,
+    },
+
+    /// Halt the program if P3 is null.
+    HaltIfNull {
+        target_reg: usize,   // P3
+        description: String, // p4
+        err_code: usize,     // p1
     },
 
     /// Start a transaction.
@@ -465,6 +510,12 @@ pub enum Insn {
         dest: usize,
     },
 
+    /// Read a complete row of data from the current cursor and write it to the destination register.
+    RowData {
+        cursor_id: CursorID,
+        dest: usize,
+    },
+
     /// Read the rowid of the current row.
     RowId {
         cursor_id: CursorID,
@@ -502,6 +553,7 @@ pub enum Insn {
         start_reg: usize,
         num_regs: usize,
         target_pc: BranchOffset,
+        eq_only: bool,
     },
 
     /// If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
@@ -538,6 +590,7 @@ pub enum Insn {
         start_reg: usize,
         num_regs: usize,
         target_pc: BranchOffset,
+        eq_only: bool,
     },
 
     // If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
@@ -665,8 +718,15 @@ pub enum Insn {
         cursor: CursorID,
         key_reg: usize,    // Must be int.
         record_reg: usize, // Blob of record data.
-        flag: usize,       // Flags used by insert, for now not used.
+        flag: InsertFlags, // Flags used by insert, for now not used.
         table_name: String,
+    },
+
+    Int64 {
+        _p1: usize,     //  unused
+        out_reg: usize, // the output register
+        _p3: usize,     // unused
+        value: i64,     //  the value being written into the output register
     },
 
     Delete {
@@ -906,6 +966,18 @@ pub enum Insn {
         target_reg: usize,
         exact: bool,
     },
+
+    /// Do an analysis of the currently open database. Store in register (P1+1) the text of an error message describing any problems.
+    /// If no problems are found, store a NULL in register (P1+1).
+    /// The register (P1) contains one less than the maximum number of allowed errors.
+    /// At most reg(P1) errors will be reported. In other words, the analysis stops as soon as reg(P1) errors are seen.
+    /// Reg(P1) is updated with the number of errors remaining. The root page numbers of all tables in the database are integers
+    /// stored in P4_INTARRAY argument. If P5 is not zero, the check is done on the auxiliary database file, not the main database file. This opcode is used to implement the integrity_check pragma.
+    IntegrityCk {
+        max_errors: usize,
+        roots: Vec<usize>,
+        message_register: usize,
+    },
 }
 
 impl Insn {
@@ -930,12 +1002,12 @@ impl Insn {
             Insn::Move { .. } => execute::op_move,
             Insn::IfPos { .. } => execute::op_if_pos,
             Insn::NotNull { .. } => execute::op_not_null,
-            Insn::Eq { .. } => execute::op_eq,
-            Insn::Ne { .. } => execute::op_ne,
-            Insn::Lt { .. } => execute::op_lt,
-            Insn::Le { .. } => execute::op_le,
-            Insn::Gt { .. } => execute::op_gt,
-            Insn::Ge { .. } => execute::op_ge,
+            Insn::Eq { .. }
+            | Insn::Ne { .. }
+            | Insn::Lt { .. }
+            | Insn::Le { .. }
+            | Insn::Gt { .. }
+            | Insn::Ge { .. } => execute::op_comparison,
             Insn::If { .. } => execute::op_if,
             Insn::IfNot { .. } => execute::op_if_not,
             Insn::OpenRead { .. } => execute::op_open_read,
@@ -957,6 +1029,7 @@ impl Insn {
             Insn::Next { .. } => execute::op_next,
             Insn::Prev { .. } => execute::op_prev,
             Insn::Halt { .. } => execute::op_halt,
+            Insn::HaltIfNull { .. } => execute::op_halt_if_null,
             Insn::Transaction { .. } => execute::op_transaction,
             Insn::AutoCommit { .. } => execute::op_auto_commit,
             Insn::Goto { .. } => execute::op_goto,
@@ -967,14 +1040,15 @@ impl Insn {
             Insn::RealAffinity { .. } => execute::op_real_affinity,
             Insn::String8 { .. } => execute::op_string8,
             Insn::Blob { .. } => execute::op_blob,
+            Insn::RowData { .. } => execute::op_row_data,
             Insn::RowId { .. } => execute::op_row_id,
             Insn::IdxRowId { .. } => execute::op_idx_row_id,
             Insn::SeekRowid { .. } => execute::op_seek_rowid,
             Insn::DeferredSeek { .. } => execute::op_deferred_seek,
-            Insn::SeekGE { .. } => execute::op_seek,
-            Insn::SeekGT { .. } => execute::op_seek,
-            Insn::SeekLE { .. } => execute::op_seek,
-            Insn::SeekLT { .. } => execute::op_seek,
+            Insn::SeekGE { .. }
+            | Insn::SeekGT { .. }
+            | Insn::SeekLE { .. }
+            | Insn::SeekLT { .. } => execute::op_seek,
             Insn::SeekEnd { .. } => execute::op_seek_end,
             Insn::IdxGE { .. } => execute::op_idx_ge,
             Insn::IdxGT { .. } => execute::op_idx_gt,
@@ -993,6 +1067,7 @@ impl Insn {
             Insn::EndCoroutine { .. } => execute::op_end_coroutine,
             Insn::Yield { .. } => execute::op_yield,
             Insn::Insert { .. } => execute::op_insert,
+            Insn::Int64 { .. } => execute::op_int_64,
             Insn::IdxInsert { .. } => execute::op_idx_insert,
             Insn::Delete { .. } => execute::op_delete,
             Insn::NewRowid { .. } => execute::op_new_rowid,
@@ -1028,6 +1103,7 @@ impl Insn {
             Insn::Affinity { .. } => execute::op_affinity,
             Insn::IdxDelete { .. } => execute::op_idx_delete,
             Insn::Count { .. } => execute::op_count,
+            Insn::IntegrityCk { .. } => execute::op_integrity_check,
         }
     }
 }
@@ -1047,4 +1123,6 @@ pub enum Cookie {
     DatabaseTextEncoding = 5,
     /// The "user version" as read and set by the user_version pragma.
     UserVersion = 6,
+    /// The auto-vacuum mode setting.
+    IncrementalVacuum = 7,
 }

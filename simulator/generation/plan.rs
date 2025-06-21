@@ -1,4 +1,10 @@
-use std::{fmt::Display, path::Path, rc::Rc, vec};
+use std::{
+    collections::HashSet,
+    fmt::{Debug, Display},
+    path::Path,
+    sync::Arc,
+    vec,
+};
 
 use limbo_core::{Connection, Result, StepResult, IO};
 use serde::{Deserialize, Serialize};
@@ -6,11 +12,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     model::{
         query::{
-            select::{Distinctness, Predicate, ResultColumn},
+            predicate::Predicate,
+            select::{Distinctness, ResultColumn},
             update::Update,
-            Create, Delete, Drop, Insert, Query, Select,
+            Create, CreateIndex, Delete, Drop, Insert, Query, Select,
         },
-        table::Value,
+        table::SimValue,
     },
     runner::{env::SimConnection, io::SimulatorIO},
     SimulatorEnv,
@@ -20,7 +27,7 @@ use crate::generation::{frequency, Arbitrary, ArbitraryFrom};
 
 use super::property::{remaining, Property};
 
-pub(crate) type ResultSet = Result<Vec<Vec<Value>>>;
+pub(crate) type ResultSet = Result<Vec<Vec<SimValue>>>;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct InteractionPlan {
@@ -97,7 +104,7 @@ pub(crate) struct InteractionPlanState {
     pub(crate) secondary_pointer: usize,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Interactions {
     Property(Property),
     Query(Query),
@@ -105,7 +112,7 @@ pub(crate) enum Interactions {
 }
 
 impl Interactions {
-    pub(crate) fn name(&self) -> Option<String> {
+    pub(crate) fn name(&self) -> Option<&str> {
         match self {
             Interactions::Property(property) => Some(property.name()),
             Interactions::Query(_) => None,
@@ -123,13 +130,13 @@ impl Interactions {
 }
 
 impl Interactions {
-    pub(crate) fn dependencies(&self) -> Vec<String> {
+    pub(crate) fn dependencies(&self) -> HashSet<String> {
         match self {
             Interactions::Property(property) => {
                 property
                     .interactions()
                     .iter()
-                    .fold(vec![], |mut acc, i| match i {
+                    .fold(HashSet::new(), |mut acc, i| match i {
                         Interaction::Query(q) => {
                             acc.extend(q.dependencies());
                             acc
@@ -138,7 +145,7 @@ impl Interactions {
                     })
             }
             Interactions::Query(query) => query.dependencies(),
-            Interactions::Fault(_) => vec![],
+            Interactions::Fault(_) => HashSet::new(),
         }
     }
 
@@ -205,6 +212,7 @@ pub(crate) struct InteractionStats {
     pub(crate) delete_count: usize,
     pub(crate) update_count: usize,
     pub(crate) create_count: usize,
+    pub(crate) create_index_count: usize,
     pub(crate) drop_count: usize,
 }
 
@@ -212,17 +220,19 @@ impl Display for InteractionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Read: {}, Write: {}, Delete: {}, Update: {}, Create: {}, Drop: {}",
+            "Read: {}, Write: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}",
             self.read_count,
             self.write_count,
             self.delete_count,
             self.update_count,
             self.create_count,
+            self.create_index_count,
             self.drop_count
         )
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum Interaction {
     Query(Query),
     Assumption(Assertion),
@@ -250,6 +260,14 @@ enum AssertionAST {
 pub(crate) struct Assertion {
     pub(crate) func: Box<AssertionFunc>,
     pub(crate) message: String,
+}
+
+impl Debug for Assertion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Assertion")
+            .field("message", &self.message)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,6 +393,9 @@ impl Interactions {
                             Query::Update(update) => {
                                 update.shadow(env);
                             }
+                            Query::CreateIndex(create_index) => {
+                                create_index.shadow(env);
+                            }
                         },
                         Interaction::Assertion(_) => {}
                         Interaction::Assumption(_) => {}
@@ -402,6 +423,7 @@ impl InteractionPlan {
         let mut create = 0;
         let mut drop = 0;
         let mut update = 0;
+        let mut create_index = 0;
 
         for interactions in &self.plan {
             match interactions {
@@ -415,6 +437,7 @@ impl InteractionPlan {
                                 Query::Create(_) => create += 1,
                                 Query::Drop(_) => drop += 1,
                                 Query::Update(_) => update += 1,
+                                Query::CreateIndex(_) => create_index += 1,
                             }
                         }
                     }
@@ -426,6 +449,7 @@ impl InteractionPlan {
                     Query::Create(_) => create += 1,
                     Query::Drop(_) => drop += 1,
                     Query::Update(_) => update += 1,
+                    Query::CreateIndex(_) => create_index += 1,
                 },
                 Interactions::Fault(_) => {}
             }
@@ -435,9 +459,10 @@ impl InteractionPlan {
             read_count: read,
             write_count: write,
             delete_count: delete,
-            create_count: create,
-            drop_count: drop,
             update_count: update,
+            create_count: create,
+            create_index_count: create_index,
+            drop_count: drop,
         }
     }
 }
@@ -473,13 +498,13 @@ impl ArbitraryFrom<&mut SimulatorEnv> for InteractionPlan {
 }
 
 impl Interaction {
-    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<Value>> {
+    pub(crate) fn shadow(&self, env: &mut SimulatorEnv) -> Vec<Vec<SimValue>> {
         match self {
             Self::Query(query) => query.shadow(env),
             Self::Assumption(_) | Self::Assertion(_) | Self::Fault(_) => vec![],
         }
     }
-    pub(crate) fn execute_query(&self, conn: &mut Rc<Connection>, io: &SimulatorIO) -> ResultSet {
+    pub(crate) fn execute_query(&self, conn: &mut Arc<Connection>, io: &SimulatorIO) -> ResultSet {
         if let Self::Query(query) = self {
             let query_str = query.to_string();
             let rows = conn.query(&query_str);
@@ -502,13 +527,7 @@ impl Interaction {
                         let row = rows.row().unwrap();
                         let mut r = Vec::new();
                         for v in row.get_values() {
-                            let v = match v {
-                                limbo_core::Value::Null => Value::Null,
-                                limbo_core::Value::Integer(i) => Value::Integer(*i),
-                                limbo_core::Value::Float(f) => Value::Float(*f),
-                                limbo_core::Value::Text(t) => Value::Text(t.as_str().to_string()),
-                                limbo_core::Value::Blob(b) => Value::Blob(b.to_vec()),
-                            };
+                            let v = v.into();
                             r.push(v);
                         }
                         out.push(r);
@@ -646,6 +665,15 @@ fn random_drop<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
     Interactions::Query(Query::Drop(Drop::arbitrary_from(rng, env)))
 }
 
+fn random_create_index<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Option<Interactions> {
+    if env.tables.is_empty() {
+        return None;
+    }
+    Some(Interactions::Query(Query::CreateIndex(
+        CreateIndex::arbitrary_from(rng, env),
+    )))
+}
+
 fn random_fault<R: rand::Rng>(_rng: &mut R, _env: &SimulatorEnv) -> Interactions {
     Interactions::Fault(Fault::Disconnect)
 }
@@ -675,6 +703,17 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats)> for Interactions {
                 (
                     remaining_.create,
                     Box::new(|rng: &mut R| random_create(rng, env)),
+                ),
+                (
+                    remaining_.create_index,
+                    Box::new(|rng: &mut R| {
+                        if let Some(interaction) = random_create_index(rng, env) {
+                            interaction
+                        } else {
+                            // if no tables exist, we can't create an index, so fallback to creating a table
+                            random_create(rng, env)
+                        }
+                    }),
                 ),
                 (
                     remaining_.delete,

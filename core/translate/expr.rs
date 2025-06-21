@@ -1,4 +1,5 @@
-use limbo_sqlite3_parser::ast::{self, UnaryOperator};
+use limbo_sqlite3_parser::ast::{self, Expr, UnaryOperator};
+use tracing::{instrument, Level};
 
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
@@ -7,7 +8,7 @@ use super::plan::TableReferences;
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
-use crate::schema::{Table, Type};
+use crate::schema::{Affinity, Table, Type};
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::builder::CursorKey;
 use crate::vdbe::{
@@ -26,6 +27,7 @@ pub struct ConditionMetadata {
     pub jump_target_when_false: BranchOffset,
 }
 
+#[instrument(skip_all, level = Level::TRACE)]
 fn emit_cond_jump(program: &mut ProgramBuilder, cond_meta: ConditionMetadata, reg: usize) {
     if cond_meta.jump_if_condition_is_true {
         program.emit_insn(Insn::If {
@@ -129,6 +131,7 @@ macro_rules! expect_arguments_even {
     }};
 }
 
+#[instrument(skip(program, referenced_tables, expr, resolver), level = Level::TRACE)]
 pub fn translate_condition_expr(
     program: &mut ProgramBuilder,
     referenced_tables: &TableReferences,
@@ -459,7 +462,16 @@ pub fn translate_expr(
                 let shared_reg = program.alloc_register();
                 translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
 
-                emit_binary_insn(program, op, shared_reg, shared_reg, target_register)?;
+                emit_binary_insn(
+                    program,
+                    op,
+                    shared_reg,
+                    shared_reg,
+                    target_register,
+                    e1,
+                    e2,
+                    referenced_tables,
+                )?;
                 program.reset_collation();
                 Ok(target_register)
             } else {
@@ -506,7 +518,16 @@ pub fn translate_expr(
                 };
                 program.set_collation(collation_ctx);
 
-                emit_binary_insn(program, op, e1_reg, e2_reg, target_register)?;
+                emit_binary_insn(
+                    program,
+                    op,
+                    e1_reg,
+                    e2_reg,
+                    target_register,
+                    e1,
+                    e2,
+                    referenced_tables,
+                )?;
                 program.reset_collation();
                 Ok(target_register)
             }
@@ -1778,6 +1799,7 @@ pub fn translate_expr(
                         Ok(target_register)
                     }
                 },
+                Func::AlterTable(_) => unreachable!(),
             }
         }
         ast::Expr::FunctionCallStar { .. } => todo!(),
@@ -1863,11 +1885,8 @@ pub fn translate_expr(
                         } else {
                             *column
                         };
-                        program.emit_insn(Insn::Column {
-                            cursor_id: read_cursor,
-                            column,
-                            dest: target_register,
-                        });
+
+                        program.emit_column(read_cursor, column, target_register);
                     }
                     let Some(column) = table.get_column_at(*column) else {
                         crate::bail_parse_error!("column index out of bounds");
@@ -2198,7 +2217,15 @@ fn emit_binary_insn(
     lhs: usize,
     rhs: usize,
     target_register: usize,
+    lhs_expr: &Expr,
+    rhs_expr: &Expr,
+    referenced_tables: Option<&TableReferences>,
 ) -> Result<()> {
+    let mut affinity = Affinity::Blob;
+    if op.is_comparison() {
+        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables);
+    }
+
     match op {
         ast::Operator::NotEquals => {
             let if_true_label = program.allocate_label();
@@ -2208,7 +2235,7 @@ fn emit_binary_insn(
                     lhs,
                     rhs,
                     target_pc: if_true_label,
-                    flags: CmpInsFlags::default(),
+                    flags: CmpInsFlags::default().with_affinity(affinity),
                     collation: program.curr_collation(),
                 },
                 target_register,
@@ -2225,7 +2252,7 @@ fn emit_binary_insn(
                     lhs,
                     rhs,
                     target_pc: if_true_label,
-                    flags: CmpInsFlags::default(),
+                    flags: CmpInsFlags::default().with_affinity(affinity),
                     collation: program.curr_collation(),
                 },
                 target_register,
@@ -2242,7 +2269,7 @@ fn emit_binary_insn(
                     lhs,
                     rhs,
                     target_pc: if_true_label,
-                    flags: CmpInsFlags::default(),
+                    flags: CmpInsFlags::default().with_affinity(affinity),
                     collation: program.curr_collation(),
                 },
                 target_register,
@@ -2259,7 +2286,7 @@ fn emit_binary_insn(
                     lhs,
                     rhs,
                     target_pc: if_true_label,
-                    flags: CmpInsFlags::default(),
+                    flags: CmpInsFlags::default().with_affinity(affinity),
                     collation: program.curr_collation(),
                 },
                 target_register,
@@ -2276,7 +2303,7 @@ fn emit_binary_insn(
                     lhs,
                     rhs,
                     target_pc: if_true_label,
-                    flags: CmpInsFlags::default(),
+                    flags: CmpInsFlags::default().with_affinity(affinity),
                     collation: program.curr_collation(),
                 },
                 target_register,
@@ -2293,7 +2320,7 @@ fn emit_binary_insn(
                     lhs,
                     rhs,
                     target_pc: if_true_label,
-                    flags: CmpInsFlags::default(),
+                    flags: CmpInsFlags::default().with_affinity(affinity),
                     collation: program.curr_collation(),
                 },
                 target_register,
@@ -2387,7 +2414,7 @@ fn emit_binary_insn(
                     lhs,
                     rhs,
                     target_pc: if_true_label,
-                    flags: CmpInsFlags::default().null_eq(),
+                    flags: CmpInsFlags::default().null_eq().with_affinity(affinity),
                     collation: program.curr_collation(),
                 },
                 target_register,
@@ -2402,7 +2429,7 @@ fn emit_binary_insn(
                     lhs,
                     rhs,
                     target_pc: if_true_label,
-                    flags: CmpInsFlags::default().null_eq(),
+                    flags: CmpInsFlags::default().null_eq().with_affinity(affinity),
                     collation: program.curr_collation(),
                 },
                 target_register,
@@ -2634,186 +2661,195 @@ pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
     }
 }
 
-/// Recursively walks an immutable expression, applying a function to each sub-expression.
-pub fn walk_expr<'a, F>(expr: &'a ast::Expr, func: &mut F) -> Result<()>
-where
-    F: FnMut(&'a ast::Expr) -> Result<()>,
-{
-    func(expr)?;
-    match expr {
-        ast::Expr::Between {
-            lhs, start, end, ..
-        } => {
-            walk_expr(lhs, func)?;
-            walk_expr(start, func)?;
-            walk_expr(end, func)?;
-        }
-        ast::Expr::Binary(lhs, _, rhs) => {
-            walk_expr(lhs, func)?;
-            walk_expr(rhs, func)?;
-        }
-        ast::Expr::Case {
-            base,
-            when_then_pairs,
-            else_expr,
-        } => {
-            if let Some(base_expr) = base {
-                walk_expr(base_expr, func)?;
-            }
-            for (when_expr, then_expr) in when_then_pairs {
-                walk_expr(when_expr, func)?;
-                walk_expr(then_expr, func)?;
-            }
-            if let Some(else_expr) = else_expr {
-                walk_expr(else_expr, func)?;
-            }
-        }
-        ast::Expr::Cast { expr, .. } => {
-            walk_expr(expr, func)?;
-        }
-        ast::Expr::Collate(expr, _) => {
-            walk_expr(expr, func)?;
-        }
-        ast::Expr::Exists(_select) | ast::Expr::Subquery(_select) => {
-            // TODO: Walk through select statements if needed
-        }
-        ast::Expr::FunctionCall {
-            args,
-            order_by,
-            filter_over,
-            ..
-        } => {
-            if let Some(args) = args {
-                for arg in args {
-                    walk_expr(arg, func)?;
-                }
-            }
-            if let Some(order_by) = order_by {
-                for sort_col in order_by {
-                    walk_expr(&sort_col.expr, func)?;
-                }
-            }
-            if let Some(filter_over) = filter_over {
-                if let Some(filter_clause) = &filter_over.filter_clause {
-                    walk_expr(filter_clause, func)?;
-                }
-                if let Some(over_clause) = &filter_over.over_clause {
-                    match over_clause.as_ref() {
-                        ast::Over::Window(window) => {
-                            if let Some(partition_by) = &window.partition_by {
-                                for part_expr in partition_by {
-                                    walk_expr(part_expr, func)?;
-                                }
-                            }
-                            if let Some(order_by_clause) = &window.order_by {
-                                for sort_col in order_by_clause {
-                                    walk_expr(&sort_col.expr, func)?;
-                                }
-                            }
-                            if let Some(frame_clause) = &window.frame_clause {
-                                walk_expr_frame_bound(&frame_clause.start, func)?;
-                                if let Some(end_bound) = &frame_clause.end {
-                                    walk_expr_frame_bound(end_bound, func)?;
-                                }
-                            }
-                        }
-                        ast::Over::Name(_) => {}
-                    }
-                }
-            }
-        }
-        ast::Expr::FunctionCallStar { filter_over, .. } => {
-            if let Some(filter_over) = filter_over {
-                if let Some(filter_clause) = &filter_over.filter_clause {
-                    walk_expr(filter_clause, func)?;
-                }
-                if let Some(over_clause) = &filter_over.over_clause {
-                    match over_clause.as_ref() {
-                        ast::Over::Window(window) => {
-                            if let Some(partition_by) = &window.partition_by {
-                                for part_expr in partition_by {
-                                    walk_expr(part_expr, func)?;
-                                }
-                            }
-                            if let Some(order_by_clause) = &window.order_by {
-                                for sort_col in order_by_clause {
-                                    walk_expr(&sort_col.expr, func)?;
-                                }
-                            }
-                            if let Some(frame_clause) = &window.frame_clause {
-                                walk_expr_frame_bound(&frame_clause.start, func)?;
-                                if let Some(end_bound) = &frame_clause.end {
-                                    walk_expr_frame_bound(end_bound, func)?;
-                                }
-                            }
-                        }
-                        ast::Over::Name(_) => {}
-                    }
-                }
-            }
-        }
-        ast::Expr::InList { lhs, rhs, .. } => {
-            walk_expr(lhs, func)?;
-            if let Some(rhs_exprs) = rhs {
-                for expr in rhs_exprs {
-                    walk_expr(expr, func)?;
-                }
-            }
-        }
-        ast::Expr::InSelect { lhs, rhs: _, .. } => {
-            walk_expr(lhs, func)?;
-            // TODO: Walk through select statements if needed
-        }
-        ast::Expr::InTable { lhs, args, .. } => {
-            walk_expr(lhs, func)?;
-            if let Some(arg_exprs) = args {
-                for expr in arg_exprs {
-                    walk_expr(expr, func)?;
-                }
-            }
-        }
-        ast::Expr::IsNull(expr) | ast::Expr::NotNull(expr) => {
-            walk_expr(expr, func)?;
-        }
-        ast::Expr::Like {
-            lhs, rhs, escape, ..
-        } => {
-            walk_expr(lhs, func)?;
-            walk_expr(rhs, func)?;
-            if let Some(esc_expr) = escape {
-                walk_expr(esc_expr, func)?;
-            }
-        }
-        ast::Expr::Parenthesized(exprs) => {
-            for expr in exprs {
-                walk_expr(expr, func)?;
-            }
-        }
-        ast::Expr::Raise(_, expr) => {
-            if let Some(raise_expr) = expr {
-                walk_expr(raise_expr, func)?;
-            }
-        }
-        ast::Expr::Unary(_, expr) => {
-            walk_expr(expr, func)?;
-        }
-        ast::Expr::Id(_)
-        | ast::Expr::Column { .. }
-        | ast::Expr::RowId { .. }
-        | ast::Expr::Literal(_)
-        | ast::Expr::DoublyQualified(..)
-        | ast::Expr::Name(_)
-        | ast::Expr::Qualified(..)
-        | ast::Expr::Variable(_) => {
-            // No nested expressions
-        }
-    }
-    Ok(())
+pub enum WalkControl {
+    Continue,     // Visit children
+    SkipChildren, // Skip children but continue walking siblings
 }
 
-fn walk_expr_frame_bound<'a, F>(bound: &'a ast::FrameBound, func: &mut F) -> Result<()>
+/// Recursively walks an immutable expression, applying a function to each sub-expression.
+pub fn walk_expr<'a, F>(expr: &'a ast::Expr, func: &mut F) -> Result<WalkControl>
 where
-    F: FnMut(&'a ast::Expr) -> Result<()>,
+    F: FnMut(&'a ast::Expr) -> Result<WalkControl>,
+{
+    match func(expr)? {
+        WalkControl::Continue => {
+            match expr {
+                ast::Expr::Between {
+                    lhs, start, end, ..
+                } => {
+                    walk_expr(lhs, func)?;
+                    walk_expr(start, func)?;
+                    walk_expr(end, func)?;
+                }
+                ast::Expr::Binary(lhs, _, rhs) => {
+                    walk_expr(lhs, func)?;
+                    walk_expr(rhs, func)?;
+                }
+                ast::Expr::Case {
+                    base,
+                    when_then_pairs,
+                    else_expr,
+                } => {
+                    if let Some(base_expr) = base {
+                        walk_expr(base_expr, func)?;
+                    }
+                    for (when_expr, then_expr) in when_then_pairs {
+                        walk_expr(when_expr, func)?;
+                        walk_expr(then_expr, func)?;
+                    }
+                    if let Some(else_expr) = else_expr {
+                        walk_expr(else_expr, func)?;
+                    }
+                }
+                ast::Expr::Cast { expr, .. } => {
+                    walk_expr(expr, func)?;
+                }
+                ast::Expr::Collate(expr, _) => {
+                    walk_expr(expr, func)?;
+                }
+                ast::Expr::Exists(_select) | ast::Expr::Subquery(_select) => {
+                    // TODO: Walk through select statements if needed
+                }
+                ast::Expr::FunctionCall {
+                    args,
+                    order_by,
+                    filter_over,
+                    ..
+                } => {
+                    if let Some(args) = args {
+                        for arg in args {
+                            walk_expr(arg, func)?;
+                        }
+                    }
+                    if let Some(order_by) = order_by {
+                        for sort_col in order_by {
+                            walk_expr(&sort_col.expr, func)?;
+                        }
+                    }
+                    if let Some(filter_over) = filter_over {
+                        if let Some(filter_clause) = &filter_over.filter_clause {
+                            walk_expr(filter_clause, func)?;
+                        }
+                        if let Some(over_clause) = &filter_over.over_clause {
+                            match over_clause.as_ref() {
+                                ast::Over::Window(window) => {
+                                    if let Some(partition_by) = &window.partition_by {
+                                        for part_expr in partition_by {
+                                            walk_expr(part_expr, func)?;
+                                        }
+                                    }
+                                    if let Some(order_by_clause) = &window.order_by {
+                                        for sort_col in order_by_clause {
+                                            walk_expr(&sort_col.expr, func)?;
+                                        }
+                                    }
+                                    if let Some(frame_clause) = &window.frame_clause {
+                                        walk_expr_frame_bound(&frame_clause.start, func)?;
+                                        if let Some(end_bound) = &frame_clause.end {
+                                            walk_expr_frame_bound(end_bound, func)?;
+                                        }
+                                    }
+                                }
+                                ast::Over::Name(_) => {}
+                            }
+                        }
+                    }
+                }
+                ast::Expr::FunctionCallStar { filter_over, .. } => {
+                    if let Some(filter_over) = filter_over {
+                        if let Some(filter_clause) = &filter_over.filter_clause {
+                            walk_expr(filter_clause, func)?;
+                        }
+                        if let Some(over_clause) = &filter_over.over_clause {
+                            match over_clause.as_ref() {
+                                ast::Over::Window(window) => {
+                                    if let Some(partition_by) = &window.partition_by {
+                                        for part_expr in partition_by {
+                                            walk_expr(part_expr, func)?;
+                                        }
+                                    }
+                                    if let Some(order_by_clause) = &window.order_by {
+                                        for sort_col in order_by_clause {
+                                            walk_expr(&sort_col.expr, func)?;
+                                        }
+                                    }
+                                    if let Some(frame_clause) = &window.frame_clause {
+                                        walk_expr_frame_bound(&frame_clause.start, func)?;
+                                        if let Some(end_bound) = &frame_clause.end {
+                                            walk_expr_frame_bound(end_bound, func)?;
+                                        }
+                                    }
+                                }
+                                ast::Over::Name(_) => {}
+                            }
+                        }
+                    }
+                }
+                ast::Expr::InList { lhs, rhs, .. } => {
+                    walk_expr(lhs, func)?;
+                    if let Some(rhs_exprs) = rhs {
+                        for expr in rhs_exprs {
+                            walk_expr(expr, func)?;
+                        }
+                    }
+                }
+                ast::Expr::InSelect { lhs, rhs: _, .. } => {
+                    walk_expr(lhs, func)?;
+                    // TODO: Walk through select statements if needed
+                }
+                ast::Expr::InTable { lhs, args, .. } => {
+                    walk_expr(lhs, func)?;
+                    if let Some(arg_exprs) = args {
+                        for expr in arg_exprs {
+                            walk_expr(expr, func)?;
+                        }
+                    }
+                }
+                ast::Expr::IsNull(expr) | ast::Expr::NotNull(expr) => {
+                    walk_expr(expr, func)?;
+                }
+                ast::Expr::Like {
+                    lhs, rhs, escape, ..
+                } => {
+                    walk_expr(lhs, func)?;
+                    walk_expr(rhs, func)?;
+                    if let Some(esc_expr) = escape {
+                        walk_expr(esc_expr, func)?;
+                    }
+                }
+                ast::Expr::Parenthesized(exprs) => {
+                    for expr in exprs {
+                        walk_expr(expr, func)?;
+                    }
+                }
+                ast::Expr::Raise(_, expr) => {
+                    if let Some(raise_expr) = expr {
+                        walk_expr(raise_expr, func)?;
+                    }
+                }
+                ast::Expr::Unary(_, expr) => {
+                    walk_expr(expr, func)?;
+                }
+                ast::Expr::Id(_)
+                | ast::Expr::Column { .. }
+                | ast::Expr::RowId { .. }
+                | ast::Expr::Literal(_)
+                | ast::Expr::DoublyQualified(..)
+                | ast::Expr::Name(_)
+                | ast::Expr::Qualified(..)
+                | ast::Expr::Variable(_) => {
+                    // No nested expressions
+                }
+            }
+        }
+        WalkControl::SkipChildren => return Ok(WalkControl::Continue),
+    };
+    Ok(WalkControl::Continue)
+}
+
+fn walk_expr_frame_bound<'a, F>(bound: &'a ast::FrameBound, func: &mut F) -> Result<WalkControl>
+where
+    F: FnMut(&'a ast::Expr) -> Result<WalkControl>,
 {
     match bound {
         ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
@@ -2824,7 +2860,7 @@ where
         | ast::FrameBound::UnboundedPreceding => {}
     }
 
-    Ok(())
+    Ok(WalkControl::Continue)
 }
 
 /// Recursively walks a mutable expression, applying a function to each sub-expression.
@@ -3019,4 +3055,76 @@ where
     }
 
     Ok(())
+}
+
+pub fn get_expr_affinity(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+) -> Affinity {
+    match expr {
+        ast::Expr::Column { table, column, .. } => {
+            if let Some(tables) = referenced_tables {
+                if let Some(table_ref) = tables.find_table_by_internal_id(*table) {
+                    if let Some(col) = table_ref.get_column_at(*column) {
+                        return col.affinity();
+                    }
+                }
+            }
+            Affinity::Blob
+        }
+        ast::Expr::Cast { type_name, .. } => {
+            if let Some(type_name) = type_name {
+                crate::schema::affinity(&type_name.name)
+            } else {
+                Affinity::Blob
+            }
+        }
+        ast::Expr::Collate(expr, _) => get_expr_affinity(expr, referenced_tables),
+        // Literals have NO affinity in SQLite!
+        ast::Expr::Literal(_) => Affinity::Blob, // No affinity!
+        _ => Affinity::Blob,                     // This may need to change. For now this works.
+    }
+}
+
+pub fn comparison_affinity(
+    lhs_expr: &ast::Expr,
+    rhs_expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+) -> Affinity {
+    let mut aff = get_expr_affinity(lhs_expr, referenced_tables);
+
+    aff = compare_affinity(rhs_expr, aff, referenced_tables);
+
+    // If no affinity determined (both operands are literals), default to BLOB
+    if !aff.has_affinity() {
+        Affinity::Blob
+    } else {
+        aff
+    }
+}
+
+pub fn compare_affinity(
+    expr: &ast::Expr,
+    other_affinity: Affinity,
+    referenced_tables: Option<&TableReferences>,
+) -> Affinity {
+    let expr_affinity = get_expr_affinity(expr, referenced_tables);
+
+    if expr_affinity.has_affinity() && other_affinity.has_affinity() {
+        // Both sides have affinity - use numeric if either is numeric
+        if expr_affinity.is_numeric() || other_affinity.is_numeric() {
+            Affinity::Numeric
+        } else {
+            Affinity::Blob
+        }
+    } else {
+        // One or both sides have no affinity - use the one that does, or Blob if neither
+        if expr_affinity.has_affinity() {
+            expr_affinity
+        } else if other_affinity.has_affinity() {
+            other_affinity
+        } else {
+            Affinity::Blob
+        }
+    }
 }

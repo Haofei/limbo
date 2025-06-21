@@ -5,7 +5,7 @@ use clap::{command, Parser};
 #[command(author, version, about, long_about = None)]
 pub struct Opts {
     /// Number of threads to run
-    #[clap(short = 't', long, help = "the number of threads", default_value_t = 8)]
+    #[clap(short = 't', long, help = "the number of threads", default_value_t = 1)]
     pub nr_threads: usize,
 
     /// Number of iterations per thread
@@ -45,11 +45,6 @@ pub struct Opts {
     pub skip_log: bool,
 
     /// Database file
-    #[clap(
-        short = 'd',
-        long,
-        help = "database file",
-        default_value = "limbostress.db"
-    )]
-    pub db_file: String,
+    #[clap(short = 'd', long, help = "database file")]
+    pub db_file: Option<String>,
 }

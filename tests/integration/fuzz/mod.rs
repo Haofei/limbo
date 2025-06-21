@@ -24,6 +24,22 @@ mod tests {
         (rng, seed)
     }
 
+    /// [See this issue for more info](https://github.com/tursodatabase/limbo/issues/1763)
+    #[test]
+    pub fn fuzz_failure_issue_1763() {
+        let db = TempDatabase::new_empty();
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+        let offending_query = "SELECT ((ceil(pow((((2.0))), (-2.0 - -1.0) / log(0.5)))) - -2.0)";
+        let limbo_result = limbo_exec_rows(&db, &limbo_conn, offending_query);
+        let sqlite_result = sqlite_exec_rows(&sqlite_conn, offending_query);
+        assert_eq!(
+            limbo_result, sqlite_result,
+            "query: {}, limbo: {:?}, sqlite: {:?}",
+            offending_query, limbo_result, sqlite_result
+        );
+    }
+
     #[test]
     pub fn arithmetic_expression_fuzz_ex1() {
         let db = TempDatabase::new_empty();
@@ -51,7 +67,7 @@ mod tests {
 
         let insert = format!(
             "INSERT INTO t VALUES {}",
-            (1..2000)
+            (1..100)
                 .map(|x| format!("({})", x))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -69,29 +85,103 @@ mod tests {
             Some("ORDER BY x ASC"),
         ];
 
-        for comp in COMPARISONS.iter() {
-            for order_by in ORDER_BY.iter() {
-                for max in 0..=2000 {
-                    let query = format!(
-                        "SELECT * FROM t WHERE x {} {} {}",
-                        comp,
-                        max,
-                        order_by.unwrap_or("")
-                    );
-                    log::trace!("query: {}", query);
-                    let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
-                    let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
-                    assert_eq!(
-                        limbo, sqlite,
-                        "query: {}, limbo: {:?}, sqlite: {:?}",
-                        query, limbo, sqlite
-                    );
+        let (mut rng, seed) = rng_from_time_or_env();
+        tracing::info!("rowid_seek_fuzz seed: {}", seed);
+
+        for iteration in 0..2 {
+            tracing::trace!("rowid_seek_fuzz iteration: {}", iteration);
+
+            for comp in COMPARISONS.iter() {
+                for order_by in ORDER_BY.iter() {
+                    let test_values = generate_random_comparison_values(&mut rng);
+
+                    for test_value in test_values.iter() {
+                        let query = format!(
+                            "SELECT * FROM t WHERE x {} {} {}",
+                            comp,
+                            test_value,
+                            order_by.unwrap_or("")
+                        );
+
+                        log::trace!("query: {}", query);
+                        let limbo_result = limbo_exec_rows(&db, &limbo_conn, &query);
+                        let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
+                        assert_eq!(
+                            limbo_result, sqlite_result,
+                            "query: {}, limbo: {:?}, sqlite: {:?}, seed: {}",
+                            query, limbo_result, sqlite_result, seed
+                        );
+                    }
                 }
             }
         }
     }
 
+    fn generate_random_comparison_values(rng: &mut ChaCha8Rng) -> Vec<String> {
+        let mut values = Vec::new();
+
+        for _ in 0..1000 {
+            let val = rng.random_range(-10000..10000);
+            values.push(val.to_string());
+        }
+
+        values.push(i64::MAX.to_string());
+        values.push(i64::MIN.to_string());
+        values.push("0".to_string());
+
+        for _ in 0..5 {
+            let val: f64 = rng.random_range(-10000.0..10000.0);
+            values.push(val.to_string());
+        }
+
+        values.push("NULL".to_string()); // Man's greatest mistake
+        values.push("'NULL'".to_string()); // SQLite dared to one up on that mistake
+        values.push("0.0".to_string());
+        values.push("-0.0".to_string());
+        values.push("1.5".to_string());
+        values.push("-1.5".to_string());
+        values.push("999.999".to_string());
+
+        values.push("'text'".to_string());
+        values.push("'123'".to_string());
+        values.push("''".to_string());
+        values.push("'0'".to_string());
+        values.push("'hello'".to_string());
+
+        values.push("'0x10'".to_string());
+        values.push("'+123'".to_string());
+        values.push("' 123 '".to_string());
+        values.push("'1.5e2'".to_string());
+        values.push("'inf'".to_string());
+        values.push("'-inf'".to_string());
+        values.push("'nan'".to_string());
+
+        values.push("X'41'".to_string());
+        values.push("X''".to_string());
+
+        values.push("(1 + 1)".to_string());
+        // values.push("(SELECT 1)".to_string()); subqueries ain't implemented yet homes.
+
+        values
+    }
+
+    fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
+        let seed = std::env::var("SEED").map_or(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            |v| {
+                v.parse()
+                    .expect("Failed to parse SEED environment variable as u64")
+            },
+        );
+        let rng = ChaCha8Rng::seed_from_u64(seed);
+        (rng, seed)
+    }
+
     #[test]
+    #[cfg(feature = "index_experimental")]
     pub fn index_scan_fuzz() {
         let db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x PRIMARY KEY)");
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
@@ -139,6 +229,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "index_experimental")]
     /// A test for verifying that index seek+scan works correctly for compound keys
     /// on indexes with various column orderings.
     pub fn index_scan_compound_key_fuzz() {
@@ -418,6 +509,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "index_experimental")]
     pub fn compound_select_fuzz() {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time();
@@ -1283,6 +1375,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "index_experimental")]
     pub fn table_logical_expression_fuzz_run() {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();

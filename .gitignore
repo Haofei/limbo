@@ -19,7 +19,6 @@ env
 dist/
 .tmp/
 
-
 *.db
 **/*.db-wal
 **/*.db-shm
@@ -36,3 +35,5 @@ testing/limbo_output.txt
 **/limbo_output.txt
 testing/*.log
 .bugbase
+limbostress.log
+simulator.log

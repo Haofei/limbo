@@ -161,9 +161,11 @@ impl ArbitrarySchema {
                     .map(|col| {
                         let mut col_def =
                             format!("  {} {}", col.name, data_type_to_sql(&col.data_type));
-                        for constraint in &col.constraints {
-                            col_def.push(' ');
-                            col_def.push_str(&constraint_to_sql(constraint));
+                        if cfg!(feature = "index_experimental") {
+                            for constraint in &col.constraints {
+                                col_def.push(' ');
+                                col_def.push_str(&constraint_to_sql(constraint));
+                            }
                         }
                         col_def
                     })
@@ -398,6 +400,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut opts = Opts::parse();
 
+    if opts.nr_threads > 1 {
+        println!("ERROR: Multi-threaded data access is not yet supported: https://github.com/tursodatabase/limbo/issues/1552");
+        return Ok(());
+    }
+
     let plan = if opts.load_log {
         read_plan_from_log_file(&mut opts)?
     } else {
@@ -407,8 +414,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut handles = Vec::with_capacity(opts.nr_threads);
     let plan = Arc::new(plan);
 
+    let tempfile = tempfile::NamedTempFile::new()?;
+    let db_file = if let Some(db_file) = opts.db_file {
+        db_file
+    } else {
+        tempfile.path().to_string_lossy().to_string()
+    };
+
     for thread in 0..opts.nr_threads {
-        let db = Arc::new(Builder::new_local(&opts.db_file).build().await?);
+        let db = Arc::new(Builder::new_local(&db_file).build().await?);
         let plan = plan.clone();
         let conn = db.connect()?;
 
@@ -444,13 +458,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 panic!("Error executing query: {}", e);
                             } else if e.contains("UNIQUE constraint failed") {
                                 println!("Skipping UNIQUE constraint violation: {}", e);
-                                continue;
                             } else {
                                 println!("Error executing query: {}", e);
                             }
                         }
                         _ => panic!("Error executing query: {}", e),
                     }
+                }
+                let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
+                if let Some(row) = res.next().await? {
+                    let value = row.get_value(0).unwrap();
+                    if value != "ok".into() {
+                        panic!("integrity check failed: {:?}", value);
+                    }
+                } else {
+                    panic!("integrity check failed: no rows");
                 }
             }
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
@@ -462,6 +484,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         handle.await??;
     }
     println!("Done. SQL statements written to {}", opts.log_file);
-    println!("Database file: {}", opts.db_file);
+    println!("Database file: {}", db_file);
     Ok(())
 }
